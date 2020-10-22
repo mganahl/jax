@@ -14,13 +14,16 @@
 
 from functools import partial
 import operator
-
+from typing import List, Tuple, Callable, Text
 import numpy as np
 import jax.numpy as jnp
-from jax import lax, device_put, jit, ops
+from jax import lax, device_put, ops
 from jax.tree_util import (tree_leaves, tree_map, tree_multimap, tree_structure,
                            Partial)
 from jax.util import safe_map as map
+from jax import ShapedArray
+
+JaxPrecisionType = type(lax.Precision.DEFAULT)
 
 def _vdot_real_part(x, y):
   """Vector dot-product guaranteed to have a real valued result."""
@@ -60,7 +63,7 @@ def _cg_solve(A, b, x0=None, *, maxiter, tol=1e-5, atol=0.0, M=_identity):
   # https://en.wikipedia.org/wiki/Conjugate_gradient_method#The_preconditioned_conjugate_gradient_method
 
   def cond_fun(value):
-    x, r, gamma, p, k = value
+    _, r, gamma, _, k = value
     rs = gamma if M is _identity else _vdot_tree(r, r)
     return (rs > atol2) & (k < maxiter)
 
@@ -176,153 +179,166 @@ def cg(A, b, x0=None, *, tol=1e-5, atol=0.0, maxiter=None, M=None):
   return x, info
 
 
-@partial(jit, static_argnums=(4, 5, 6, 7))
-def arnoldi_fact(matvec, v0, Vm, Hm, start, num_krylov_vecs,
-                 tol, precision):
+def iterative_classical_gram_schmidt(vector, krylov_vectors,
+                                     precision=lax.Precision.HIGHEST,
+                                     iterations=2):
   """
-  Compute an m-step arnoldi factorization of `matvec`, with
-  m <= `num_krylov_vecs`. The factorization will
-  do at most `num_krylov_vecs` steps, and stop early if
-  an invariant subspace is encountered. Krylov vectors,
-  overlaps between krylov vectors and norms are written to
-  `Vm` and `Hm`, respectively. Upon termination,
-  `Vm` and `Hm` will satisfy the Arnoldi recurrence relation
+  Orthogonalize `vector`  to all rows of `krylov_vectors`, using
+  an iterated classical gram schmidt orthogonalization.
+  Args:
+    vector: Initial vector.
+    krylov_vectors: Matrix of krylov vectors, each row is treated as a
+      vector.
+    iterations: Number of iterations.
+  Returns:
+    jax.ShapedArray: The orthogonalized vector.
+    jax.ShapedArray: The overlaps of `vector` with all previous
+      krylov vectors
+  """
+  vec = vector
+  overlaps = 0
+  for _ in range(iterations):
+    ov = jnp.dot(krylov_vectors.conj(), vec, precision=precision)
+    vec = vec - jnp.dot(ov, krylov_vectors, precision=precision)
+    overlaps = overlaps + ov
+  return vec, overlaps
+
+def lanczos_factorization(matvec: Callable, v0: ShapedArray,
+    Vm: ShapedArray, alphas: ShapedArray, betas: ShapedArray,
+    start: int, num_krylov_vecs: int, tol: float, precision: JaxPrecisionType
+):
+  """
+  Compute an m-step lanczos factorization of `matvec`, with
+  m <=`num_krylov_vecs`. The factorization will
+  do at most `num_krylov_vecs` steps, and terminate early
+  if an invariant subspace is encountered. The returned arrays
+  `alphas`, `betas` and `Vm` will satisfy the Lanczos recurrence relation
   ```
-  matrix @ Vm.T - Vm.T @ Hm - fm * em = 0
+  matrix @ Vm - Vm @ Hm - fm * em = 0
   ```
   with `matrix` the matrix representation of `matvec`,
-  `fm = residual * norm` (`residual` and `norm` returned
-  by `arnoldi_fact`), and `em` a cartesian basis vector of
-  shape `(1, kv.shape[1])` with `em[0, -1] == 1` and 0 elsewhere.
-  NOTE: Krylov vectors are currently stored in row-major
-  format in `Vm`, i.e. each row of `Vm` is a krylov vector.
-  NOTE: The caller is responsible for dtype consistency between
+  `Hm = jnp.diag(alphas) + jnp.diag(betas, -1) + jnp.diag(betas.conj(), 1)`
+  `fm=residual * norm`, and `em` a cartesian basis vector of shape
+  `(1, kv.shape[1])` with `em[0, -1] == 1` and 0 elsewhere.
+
+  Note that the caller is responsible for dtype consistency between
   the inputs, i.e. dtypes between all input arrays have to match.
 
   Args:
     matvec: The matrix vector product.
     v0: Initial state to `matvec`.
     Vm: An array for storing the krylov vectors. The individual
-      vectors are stored as rows in the array.
+      vectors are stored as columns.
       The shape of `krylov_vecs` has to be
       (num_krylov_vecs + 1, np.ravel(v0).shape[0]).
-    Hm: Matrix of overlaps. The shape has to be
-      (num_krylov_vecs + 1,num_krylov_vecs + 1).
+    alphas: An array for storing the diagonal elements of the reduced
+      operator.
+    betas: An array for storing the lower diagonal elements of the
+      reduced operator.
     start: Integer denoting the start position where the first
       produced krylov_vector should be inserted into `Vm`
     num_krylov_vecs: Number of krylov iterations, should be identical to
       `Vm.shape[0] + 1`
     tol: Convergence parameter. Iteration is terminated if the norm of a
       krylov-vector falls below `tol`.
+
   Returns:
     jax.ShapedArray: An array of shape
       `(num_krylov_vecs, np.prod(initial_state.shape))` of krylov vectors.
-    jax.ShapedArray: Upper Hessenberg matrix of shape
-      `(num_krylov_vecs, num_krylov_vecs`) of the Arnoldi processs.
-    jax.ShapedArray: The unnormalized residual of the Arnoldi process.
+    jax.ShapedArray: The diagonal elements of the tridiagonal reduced
+      operator ("alphas")
+    jax.ShapedArray: The lower-diagonal elements of the tridiagonal reduced
+      operator ("betas")
+    jax.ShapedArray: The unnormalized residual of the Lanczos process.
     float: The norm of the residual.
     int: The number of performed iterations.
     bool: if `True`: iteration hit an invariant subspace.
           if `False`: iteration terminated without encountering
-
+          an invariant subspace.
   """
 
-  def iterative_classical_gram_schmidt(vector, krylov_vectors, iterations=2):
-    """
-    Orthogonalize `vector`  to all rows of `krylov_vectors`, using
-    an iterated classical gram schmidt orthogonalization.
-    Args:
-      vector: Initial vector.
-      krylov_vectors: Matrix of krylov vectors, each row is treated as a
-        vector.
-      iterations: Number of iterations.
-    Returns:
-      jax.ShapedArray: The orthogonalized vector.
-      jax.ShapedArray: The overlaps of `vector` with all previous
-        krylov vectors
-    """
-    vec = vector
-    overlaps = 0
-    for _ in range(iterations):
-      ov = jnp.dot(krylov_vectors.conj(), vec, precision=precision)
-      vec = vec - jnp.dot(ov, krylov_vectors, precision=precision)
-      overlaps = overlaps + ov
-    return vec, overlaps
-
+  shape = v0.shape
   Z = jnp.linalg.norm(v0)
   #only normalize if norm > tol, else return zero vector
   v = lax.cond(Z > tol, lambda x: v0 / Z, lambda x: v0 * 0.0, None)
-  Vm = Vm.at[start, :].set(v)
-  Hm = lax.cond(start > 0, lambda x: Hm.at[x, x - 1].set(Z), lambda x: Hm,
-                start)
+  Vm = Vm.at[start, :].set(jnp.ravel(v))
+  betas = lax.cond(
+      start > 0,
+      lambda x: betas.at[start - 1].set(Z),
+      lambda x: betas, start)
 
   # body of the arnoldi iteration
   def body(vals):
-    Vm, Hm, previous_vector, _, i = vals
+    Vm, alphas, betas, previous_vector, _, i = vals
     Av = matvec(previous_vector)
-
     Av, overlaps = iterative_classical_gram_schmidt(
-        Av,
-        (i >= jnp.arange(Vm.shape[0]))[:, None] * Vm)
-    Hm = Hm.at[:, i].set(overlaps)
+        Av.ravel(),
+        (i >= jnp.arange(Vm.shape[0]))[:, None] * Vm, precision)
+    alphas = alphas.at[i].set(overlaps[i])
     norm = jnp.linalg.norm(Av)
-
+    Av = jnp.reshape(Av, shape)
     # only normalize if norm is larger than threshold,
     # otherwise return zero vector
-    Av = lax.cond(norm > tol, lambda x: Av / norm, lambda x: Av * 0.0, None)
-    Vm, Hm = lax.cond(
+    Av = lax.cond(norm > tol, lambda x: Av/norm, lambda x: Av * 0.0, None)
+    Vm, betas = lax.cond(
         i < num_krylov_vecs - 1,
-        lambda x: (Vm.at[i + 1, :].set(Av), Hm.at[i + 1, i].set(norm)),  #pylint: disable=line-too-long
-        lambda x: (Vm, Hm),
+        lambda x: (Vm.at[i + 1, :].set(Av.ravel()), betas.at[i].set(norm)),
+        lambda x: (Vm, betas),
         None)
 
-    return [Vm, Hm, Av, norm, i + 1]
+    return [Vm, alphas, betas, Av, norm, i + 1]
 
   def cond_fun(vals):
     # Continue loop while iteration < num_krylov_vecs and norm > tol
-    norm, iteration = vals[3], vals[4]
+    norm, iteration = vals[4], vals[5]
     counter_done = (iteration >= num_krylov_vecs)
     norm_not_too_small = norm > tol
     continue_iteration = lax.cond(counter_done, lambda x: False,
-                                  lambda x: norm_not_too_small, None)
+                                      lambda x: norm_not_too_small, None)
     return continue_iteration
 
-  initial_values = [Vm, Hm, v, Z, start]
+  initial_values = [Vm, alphas, betas, v, Z, start]
   final_values = lax.while_loop(cond_fun, body, initial_values)
-  krylov_vectors, H, residual, norm, it = final_values
-  return krylov_vectors, H, residual, norm, it, norm < tol
+  Vm, alphas, betas, residual, norm, it = final_values
+  return Vm, alphas, betas, residual, norm, it, norm < tol
 
-
-@partial(jit, static_argnums=(0,))
-def LR_sort(p, evals):
-  inds = jnp.argsort(jnp.real(evals), kind='stable')[::-1]
+def SA_sort(
+    p: int,
+    evals: ShapedArray) -> Tuple[ShapedArray, ShapedArray]:
+  inds = jnp.argsort(evals)
   shifts = evals[inds][-p:]
   return shifts, inds
 
+def LA_sort(p: int,
+            evals: ShapedArray) -> Tuple[ShapedArray, ShapedArray]:
+  inds = jnp.argsort(evals)[::-1]
+  shifts = evals[inds][-p:]
+  return shifts, inds
 
-@partial(jit, static_argnums=(3, 4))
-def shifted_QR(Vm, Hm, fm, numeig, sort_fun):
-  evals, _ = jnp.linalg.eig(Hm)
-  shifts, _ = sort_fun(evals)
+def shifted_QR(
+    Vm: ShapedArray, Hm: ShapedArray, fm: ShapedArray,
+    shifts: ShapedArray,
+    numeig: int) -> Tuple[ShapedArray, ShapedArray, ShapedArray]:
   # compress arnoldi factorization
   q = jnp.zeros(Hm.shape[0], dtype=Hm.dtype)
   q = q.at[-1].set(1.0)
 
   def body(i, vals):
     Vm, Hm, q = vals
-    Qj, _ = jnp.linalg.qr(Hm - shifts[i] * jnp.eye(Hm.shape[0], dtype=Hm.dtype))
-    Hm = Qj.T.conj() @ Hm @ Qj
-    Vm = Qj.T @ Vm
-    q = q @ Qj
+    shift = shifts[i] * jnp.eye(Hm.shape[0], dtype=Hm.dtype)
+    Qj, R = jnp.linalg.qr(Hm - shift)
+    Hm = jnp.matmul(R, Qj, precision=lax.Precision.HIGHEST) + shift
+    Vm = jnp.matmul(Qj.T, Vm, precision=lax.Precision.HIGHEST)
+    q = jnp.matmul(q, Qj, precision=lax.Precision.HIGHEST)
     return Vm, Hm, q
 
-  Vm, Hm, q = lax.fori_loop(0, shifts.shape[0], body, (Vm, Hm, q))
+  Vm, Hm, q = lax.fori_loop(0, shifts.shape[0], body,
+                                (Vm, Hm, q))
   fk = Vm[numeig, :] * Hm[numeig, numeig - 1] + fm * q[numeig - 1]
   return Vm, Hm, fk
 
-
-@partial(jit, static_argnums=(3,))
-def get_vectors(Vm, unitary, inds, numeig):
+def get_vectors(Vm: ShapedArray, unitary: ShapedArray,
+                inds: ShapedArray, numeig: int) -> ShapedArray:
 
   def body_vector(i, states):
     dim = unitary.shape[1]
@@ -333,15 +349,14 @@ def get_vectors(Vm, unitary, inds, numeig):
 
   state_vectors = jnp.zeros([numeig, Vm.shape[1]], dtype=Vm.dtype)
   state_vectors = lax.fori_loop(0, numeig * Vm.shape[0], body_vector,
-                                state_vectors)
+                                    state_vectors)
   state_norms = jnp.linalg.norm(state_vectors, axis=1)
   state_vectors = state_vectors / state_norms[:, None]
   return state_vectors
 
 
-@partial(jit, static_argnums=(2, 3))
-def check_eigvals_convergence_iram(beta_m, Hm, tol, numeig):
-  #ARPACK convergence criterion
+def check_eigvals_convergence(beta_m: float, Hm: ShapedArray,
+                              tol: float, numeig: int) -> bool:
   eigvals, eigvecs = jnp.linalg.eig(Hm)
   # TODO (mganahl) confirm that this is a valid matrix norm)
   Hm_norm = jnp.linalg.norm(Hm)
@@ -351,158 +366,160 @@ def check_eigvals_convergence_iram(beta_m, Hm, tol, numeig):
   vals = jnp.abs(eigvecs[numeig - 1, :numeig])
   return jnp.all(beta_m * vals < thresh)
 
-
-#@partial(jit, static_argnums=(2, 3, 4, 5, 6, 7))
-def eigs(matvec, x0,
-         restart=20, numeig=4, which="LR", tol=1E-8,
-         maxiter=1000, precision=lax.Precision.HIGHEST):
+def eigsh(
+    matvec: Callable, initial_state: ShapedArray,
+    num_krylov_vecs: int, numeig: int, which: Text, tol: float, maxiter: int,
+    precision: JaxPrecisionType
+) -> Tuple[ShapedArray, List[ShapedArray], int]:
   """
-  Implicitly restarted arnoldi factorization of `matvec`. The routine
+  Implicitly restarted Lanczos factorization of `matvec`. The routine
   finds the lowest `numeig` eigenvector-eigenvalue pairs of `matvec`
   by alternating between compression and re-expansion of an initial
-  `restart`-step Arnoldi factorization.
+  `num_krylov_vecs`-step Lanczos factorization.
 
   Note: The caller has to ensure that the dtype of the return value
   of `matvec` matches the dtype of the initial state. Otherwise jax
   will raise a TypeError.
 
   NOTE: Under certain circumstances, the routine can return spurious
-  eigenvalues 0.0: if the Arnoldi iteration terminated early
-  (after numits < restart iterations)
+  eigenvalues 0.0: if the Lanczos iteration terminated early
+  (after numits < num_krylov_vecs iterations)
   and numeig > numits, then spurious 0.0 eigenvalues will be returned.
 
   Args:
     matvec: A callable representing the linear operator.
-    x0: An starting vector for the iteration.
-    restart: Number of krylov vectors of the arnoldi factorization.
+    initial_state: An starting vector for the iteration.
+    num_krylov_vecs: Number of krylov vectors of the Lanczos factorization.
       numeig: The number of desired eigenvector-eigenvalue pairs.
     which: Which eigenvalues to target.
       Currently supported: `which = 'LR'` (largest real part).
     tol: Convergence flag. If the norm of a krylov vector drops below `tol`
       the iteration is terminated.
     maxiter: Maximum number of (outer) iteration steps.
-    precision: lax.Precision used within lax operations.
+    precision: jax.lax.Precision used within lax operations.
+
   Returns:
-    jax.ShapedArray: Eigenvalues
-    List: Eigenvectors
-    int: Number of inner krylov iterations of the last arnoldi
+    jax.ShapedArray: Eigenvalues.
+    List: Eigenvectors.
+    int: Number of inner Krylov iterations of the last Lanczos
       factorization.
   """
-  dtype = x0.dtype
-  dim = x0.shape[0]
-  num_expand = restart - numeig
 
-  if (num_expand <= 1) and (restart < dim):
-    raise ValueError(f"restart must be between numeig + 1 <"
-                     f" restart <= dim = {dim},"
-                     f" restart = {restart}")
+  shape = initial_state.shape
+  dtype = initial_state.dtype
+
+  dim = np.prod(shape).astype(np.int32)
+  num_expand = num_krylov_vecs - numeig
+  #note: the second part of the cond is for testing purposes
+  if num_krylov_vecs <= numeig < dim:
+    raise ValueError(f"num_krylov_vecs must be between numeig <"
+                     f" num_krylov_vecs <= dim = {dim},"
+                     f" num_krylov_vecs = {num_krylov_vecs}")
   if numeig > dim:
     raise ValueError(f"number of requested eigenvalues numeig = {numeig} "
                      f"is larger than the dimension of the operator "
                      f"dim = {dim}")
 
   # initialize arrays
-  Vm = jnp.zeros((restart, dim),
-                 dtype=dtype)
-  Hm = jnp.zeros((restart, restart), dtype=dtype)
-  # perform initial arnoldi factorization
-  Vm, Hm, residual, norm, numits, ar_converged = arnoldi_fact(
-      matvec, x0, Vm, Hm, 0, restart, tol, precision)
-  fm = residual * norm
+  Vm = jnp.zeros(
+      (num_krylov_vecs, jnp.ravel(initial_state).shape[0]), dtype=dtype)
+  alphas = jnp.zeros(num_krylov_vecs, dtype=dtype)
+  betas = jnp.zeros(num_krylov_vecs - 1, dtype=dtype)
+
+  # perform initial lanczos factorization
+  Vm, alphas, betas, residual, norm, numits, ar_converged = lanczos_factorization(#pylint: disable=line-too-long
+      matvec, initial_state, Vm, alphas, betas, 0, num_krylov_vecs, tol,
+      precision)
+  fm = residual.ravel() * norm
 
   # sort_fun returns `num_expand` least relevant eigenvalues
-  # (those to be projected out)
-  if which == 'LR':
-    sort_fun = Partial(LR_sort, num_expand)
+  # (those to be removed by shifted QR)
+  if which == 'LA':
+    sort_fun = Partial(LA_sort, num_expand)
+  elif which == 'SA':
+    sort_fun = Partial(SA_sort, num_expand)
   else:
     raise ValueError(f"which = {which} not implemented")
 
-  it = 1  # we already did one arnoldi factorization
-  if maxiter > 1:
-    # cast arrays to correct complex dtype
-    if Vm.dtype == np.float64:
-      dtype = np.complex128
-    elif Vm.dtype == np.float32:
-      dtype = np.complex64
-    elif Vm.dtype == np.complex128:
-      dtype = Vm.dtype
-    elif Vm.dtype == np.complex64:
-      dtype = Vm.dtype
-    else:
-      raise TypeError(f'dtype {Vm.dtype} not supported')
-
-    Vm = Vm.astype(dtype)
-    Hm = Hm.astype(dtype)
-    fm = fm.astype(dtype)
-
+  it = 1  # we already did one lanczos factorization
   def outer_loop(carry):
-    Hm, Vm, fm, it, numits, ar_converged, _, _, = carry
-    # perform shifted QR iterations to compress arnoldi factorization
+    alphas, betas, Vm, fm, it, numits, ar_converged, _, _ = carry
+    # pack into alphas and betas into tridiagonal matrix
+    Hm = jnp.diag(alphas) + jnp.diag(betas, -1) + jnp.diag(
+        betas.conj(), 1)
+    evals, _ = jnp.linalg.eigh(Hm)
+    shifts, _ = sort_fun(evals)
+    # perform shifted QR iterations to compress lanczos factorization
     # Note that ||fk|| typically decreases as one iterates the outer loop
     # indicating that iram converges.
     # ||fk|| = \beta_m in reference above
-    Vk, Hk, fk = shifted_QR(Vm, Hm, fm, numeig, sort_fun)
+
+    Vk, Hk, fk = shifted_QR(Vm, Hm, fm, shifts, numeig)
     # reset matrices
     Vk = Vk.at[numeig:, :].set(0.0)
     Hk = Hk.at[numeig:, :].set(0.0)
     Hk = Hk.at[:, numeig:].set(0.0)
+
     beta_k = jnp.linalg.norm(fk)
-    converged = check_eigvals_convergence_iram(beta_k, Hk, tol, numeig)
+    converged = check_eigvals_convergence(beta_k, Hk, tol, numeig)
+    # extract new alphas and betas
+    alphas = jnp.diag(Hk)
+    betas = jnp.diag(Hk, -1)
 
-    def do_arnoldi(vals):
-      Vk, Hk, fk, _, _, _, _ = vals
+    #####################################################
+    # faked conditional statement using while control flow
+    # only perform a lanczos factorization if `not converged`
+
+    def do_lanczos(vals):
+      Vk, alphas, betas, fk, _, _, _, _ = vals
       # restart
-      Vm, Hm, residual, norm, numits, ar_converged = arnoldi_fact(
-          matvec, fk, Vk, Hk, numeig,
-          restart, tol, precision)
+      Vm, alphas, betas, residual, norm, numits, ar_converged = lanczos_factorization(#pylint: disable=line-too-long
+          matvec, jnp.reshape(fk, shape), Vk, alphas, betas,
+          numeig, num_krylov_vecs, tol, precision)
       fm = residual.ravel() * norm
-      return [Vm, Hm, fm, norm, numits, ar_converged, False]
+      return [Vm, alphas, betas, fm, norm, numits, ar_converged, False]
 
-    def cond_arnoldi(vals):
-      return vals[6]
+    def cond_lanczos(vals):
+      return vals[7]
 
-    res = lax.while_loop(cond_arnoldi, do_arnoldi, [
-        Vk, Hk, fk,
+    res = lax.while_loop(cond_lanczos, do_lanczos, [
+        Vk, alphas, betas, fk,
         jnp.linalg.norm(fk), numeig, False,
         jnp.logical_not(converged)
     ])
-    
-    Vm, Hm, fm, norm, numits, ar_converged = res[0:6]
-    out_vars = [Hm, Vm, fm, it + 1, numits, ar_converged, converged, norm]
+    Vm, alphas, betas, fm, norm, numits, ar_converged = res[0:7]
+    #####################################################
+
+    out_vars = [
+        alphas, betas, Vm, fm, it + 1, numits, ar_converged, converged, norm]
     return out_vars
 
   def cond_fun(carry):
-    it, ar_converged, converged = carry[3], carry[5], carry[6]
-    return lax.cond(it < maxiter, lambda x: x, lambda x: False,
-                    jnp.logical_not(jnp.logical_or(converged, ar_converged)))
+    it, ar_converged, converged = carry[4], carry[6], carry[7]
+    return lax.cond(
+        it < maxiter, lambda x: x, lambda x: False,
+        jnp.logical_not(jnp.logical_or(converged, ar_converged)))
 
   converged = False
-  carry = [Hm, Vm, fm, it, numits, ar_converged, converged, norm]
+  carry = [alphas, betas, Vm, fm, it, numits, ar_converged, converged, norm]
   res = lax.while_loop(cond_fun, outer_loop, carry)
-  Hm, Vm = res[0], res[1]
-  numits, converged = res[4], res[6]
-  # if `ar_converged` then `norm`is below convergence threshold
-  # set it to 0.0 in this case to prevent `jnp.linalg.eig` from finding a
-  # spurious eigenvalue of order `norm`.
-  Hm = Hm.at[numits, numits - 1].set(
-      lax.cond(converged, lambda x: Hm.dtype.type(0.0), lambda x: x,
-               Hm[numits, numits - 1]))
+  alphas, betas, Vm = res[0], res[1], res[2]
+  numits, ar_converged, converged = res[5], res[6], res[7]
+  Hm = jnp.diag(alphas) + jnp.diag(betas, -1) + jnp.diag(
+      betas.conj(), 1)
 
-  # if the Arnoldi-factorization stopped early (after `numit` iterations)
   # before exhausting the allowed size of the Krylov subspace,
-  # (i.e. `numit` < 'restart'), set elements
+  # (i.e. `numit` < 'num_krylov_vecs'), set elements
   # at positions m, n with m, n >= `numit` to 0.0.
-
   # FIXME (mganahl): under certain circumstances, the routine can still
-  # return spurious 0 eigenvalues: if arnoldi terminated early
-  # (after numits < restart iterations)
+  # return spurious 0 eigenvalues: if lanczos terminated early
+  # (after numits < num_krylov_vecs iterations)
   # and numeig > numits, then spurious 0.0 eigenvalues will be returned
-
-  Hm = (numits > jnp.arange(restart))[:, None] * Hm * (
-      numits > jnp.arange(restart))[None, :]
-  eigvals, U = jnp.linalg.eig(Hm)
+  Hm = (numits > jnp.arange(num_krylov_vecs))[:, None] * Hm * (
+      numits > jnp.arange(num_krylov_vecs))[None, :]
+  eigvals, U = jnp.linalg.eigh(Hm)
   inds = sort_fun(eigvals)[1][:numeig]
   vectors = get_vectors(Vm, U, inds, numeig)
   return eigvals[inds], [
-      vectors[n, :] for n in range(numeig)
+      jnp.reshape(vectors[n, :], shape) for n in range(numeig)
   ], numits
