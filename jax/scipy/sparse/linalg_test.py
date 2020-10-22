@@ -154,22 +154,29 @@ def test_eigsh_small_matrix(dtype, which):
       np.stack(U, axis=1), eta, U_exact, eta_exact, thresh=thresh[dtype])
 
 
-def get_hoppings(dtype, N):
-  hop = -jnp.ones(N - 1, dtype)
-  if dtype in (np.complex128, np.complex64):
-    hop -= 1j * jnp.ones(N - 1, dtype)
+def get_hoppings(dtype, N, which):
+  if which == 'uniform':
+    hop = -jnp.ones(N - 1, dtype)
+    if dtype in (np.complex128, np.complex64):
+      hop -= 1j * jnp.ones(N - 1, dtype)
+  elif which == 'randn':
+    hop = -jnp.array(np.random.randn(N - 1, dtype))
+    if dtype in (np.complex128, np.complex64):
+      hop -= 1j * jnp.array(np.random.randn(N - 1, dtype))
   return hop
 
+
 @pytest.mark.parametrize("dtype", [np.float64, np.complex128])
+@pytest.mark.parametrize("hop_type", ['uniform', 'randn'])
 @pytest.mark.parametrize("N", [14, 18])
-def test_eigsh_large_problem(N, dtype):
+def test_eigsh_large_problem(N, dtype, hop_type):
   """
   Find the lowest eigenvalues and eigenvectors
   of a 1d free-fermion Hamiltonian on N sites.
   The dimension of the hermitian matrix is
   (2**N, 2**N).
   """
-  hop = get_hoppings(dtype, N)
+  hop = get_hoppings(dtype, N, hop_type)
   pot = jnp.ones(N, dtype)
   P = jnp.diag(np.array([0, -1])).astype(dtype)
   c = jnp.array([[0, 1], [0, 0]], dtype)
@@ -179,6 +186,7 @@ def test_eigsh_large_problem(N, dtype):
   eyen = jnp.kron(eye, n)
   ccT = jnp.kron(c @ P, c.T)
   cTc = jnp.kron(c.T, c)
+
   @jax.jit
   def matvec(vec):
     x = vec.reshape((4, 2**(N - 2)))
