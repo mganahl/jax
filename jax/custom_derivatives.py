@@ -183,9 +183,10 @@ class custom_jvp:
       raise AttributeError(msg.format(self.__name__))
     args = _resolve_kwargs(self.fun, args, kwargs)
     if self.nondiff_argnums:
-      args = [_stop_gradient(x) if i in self.nondiff_argnums else x
+      nondiff_argnums = set(self.nondiff_argnums)
+      args = [_stop_gradient(x) if i in nondiff_argnums else x
               for i, x in enumerate(args)]
-      diff_argnums = [i for i in range(len(args)) if i not in self.nondiff_argnums]
+      diff_argnums = [i for i in range(len(args)) if i not in nondiff_argnums]
       f_, dyn_args = argnums_partial(lu.wrap_init(self.fun), diff_argnums, args)
       static_args = [args[i] for i in self.nondiff_argnums]
       jvp = _add_args(lu.wrap_init(self.jvp), static_args)
@@ -331,12 +332,13 @@ def _custom_jvp_call_jaxpr_vmap(
   @pe._memoize
   def batched_jvp_jaxpr_thunk():
     jvp_jaxpr = core.ClosedJaxpr(*jvp_jaxpr_thunk())  # consts can be tracers
-    _, all_batched = batching.batch_jaxpr(jvp_jaxpr, size, in_batched * 2, False)
+    _, args_batched = split_list(in_batched, [num_consts])
+    _, all_batched = batching.batch_jaxpr(jvp_jaxpr, size, args_batched * 2, False)
     primals_batched, tangents_batched = split_list(all_batched, [num_out])
     out_batched = map(op.or_, primals_batched, tangents_batched)
     out_dims2.append([0 if b else not_mapped for b in out_batched])
     batched_jvp_jaxpr, _ = batching.batch_jaxpr(
-        jvp_jaxpr, size, in_batched * 2, out_batched * 2)
+        jvp_jaxpr, size, args_batched * 2, out_batched * 2)
     return batched_jvp_jaxpr.jaxpr, batched_jvp_jaxpr.consts
 
   batched_outs = custom_jvp_call_jaxpr_p.bind(
@@ -455,7 +457,8 @@ class custom_vjp:
     args = _resolve_kwargs(self.fun, args, kwargs)
     if self.nondiff_argnums:
       for i in self.nondiff_argnums: _check_for_tracers(args[i])
-      dyn_argnums = [i for i in range(len(args)) if i not in self.nondiff_argnums]
+      nondiff_argnums = set(self.nondiff_argnums)
+      dyn_argnums = [i for i in range(len(args)) if i not in nondiff_argnums]
       f_, dyn_args = argnums_partial(lu.wrap_init(self.fun), dyn_argnums, args)
       static_args = [args[i] for i in self.nondiff_argnums]
       fwd, _ = argnums_partial(lu.wrap_init(self.fwd), dyn_argnums, args)
@@ -615,6 +618,7 @@ def _custom_vjp_call_jaxpr_vmap(
           else x for x, d in zip(args, in_dims)]
 
   in_batched = [d is not not_mapped for d in in_dims]
+  _, args_batched = split_list(in_batched, [num_consts])
   batched_fun_jaxpr, out_batched = batching.batch_jaxpr(fun_jaxpr, size, in_batched, False)
   out_dims1 = [0 if b else not_mapped for b in out_batched]
   out_dims2 = []
@@ -622,14 +626,15 @@ def _custom_vjp_call_jaxpr_vmap(
   @pe._memoize
   def batched_fwd_jaxpr_thunk():
     fwd_jaxpr = core.ClosedJaxpr(*fwd_jaxpr_thunk())  # consts can be tracers
-    batched_fwd_jaxpr, out_batched = batching.batch_jaxpr(fwd_jaxpr, size, in_batched, False)
+    batched_fwd_jaxpr, out_batched = batching.batch_jaxpr(
+        fwd_jaxpr, size, args_batched, False)
     out_dims2.append([0 if b else not_mapped for b in out_batched])
     return batched_fwd_jaxpr.jaxpr, batched_fwd_jaxpr.consts
 
-  fwd_in_dims = [0 if b else not_mapped for b in in_batched]
+  fwd_args_batched = [0 if b else not_mapped for b in args_batched]
   fwd_out_dims = lambda: out_dims2[0]
   # TODO(mattjj,apaszke): Support collectives in custom_vjp?
-  batched_bwd = batching.batch_fun(bwd, fwd_out_dims, fwd_in_dims,
+  batched_bwd = batching.batch_fun(bwd, fwd_out_dims, fwd_args_batched,
                                    axis_name='__unused_axis_name', sum_match=True)
 
   batched_outs = custom_vjp_call_jaxpr_p.bind(
